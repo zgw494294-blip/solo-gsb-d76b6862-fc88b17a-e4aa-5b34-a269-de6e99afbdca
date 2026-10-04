@@ -55,6 +55,62 @@ FIRMWARE_DB_PATH=./firmware.db uvicorn app.main:app --port 8000
     之后迟到的确认返回 **`409`**。
   - 两槽**禁止任何写入**（声明 / 分块都返回 `409 trial_pending_write_locked`）。
 - 并发操作经 SQLite `BEGIN IMMEDIATE` 串行化，等价于某种串行执行。
+  写请求的响应快照在**同一写事务内**生成、**提交成功后才返回**：
+  响应严格反映本次操作完成时的状态，不会混入随后请求的写入；
+  提交失败不会返回成功。
+
+## 并发响应一致性（复现与回归）
+
+**问题**：`PUT /update`、`POST /devices`、`POST /confirm` 曾把"写事务"与
+"返回查询"拆成两个连接——提交后、查询前没有写锁保护。同一设备两次合法声明
+（长度 3、6）并发时，若第二次写入落在第一次"提交后、查询前"的窗口内，
+两份响应会都显示 `declared_length=6`（第一份应为 3）。
+
+**修复**：响应快照改在同一 `BEGIN IMMEDIATE` 写事务内、提交之前生成
+（写锁保证其间无其他写入），提交成功后才返回；提交失败返回 5xx 而非成功。
+
+**复现 / 验证**（服务已按上文用 `docker compose up --build -d` 启动）：
+
+```bash
+# 1) 创建设备
+curl -s -X POST http://localhost:8000/devices \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id": "race-demo", "initial_image_base64": "aW5pdA=="}' | jq '.slots.slot1.status'
+
+# 2) 并发提交两份声明：长度 3 与长度 6
+python3 - <<'PY'
+import json, threading, urllib.request
+
+def declare(length, sha, out, key):
+    req = urllib.request.Request(
+        "http://localhost:8000/devices/race-demo/update",
+        data=json.dumps({"length": length, "sha256": sha}).encode(),
+        method="PUT", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        out[key] = json.load(r)["slots"]["slot1"]["declared_length"]
+
+out = {}
+t1 = threading.Thread(target=declare, args=(3, "44" * 32, out, "len3"))
+t2 = threading.Thread(target=declare, args=(6, "55" * 32, out, "len6"))
+t1.start(); t2.start(); t1.join(); t2.join()
+print(out)
+# 修复后恒为 {'len3': 3, 'len6': 6}：各响应反映各自操作完成时的状态；
+# 旧实现中两份响应可能都显示 6
+PY
+
+# 3) 最终数据库状态 = 串行顺序中后提交的那一份声明
+curl -s http://localhost:8000/devices/race-demo | jq '.slots.slot1.declared_length'
+```
+
+**回归测试**：`test_api.py` 第 12 节用"提交闸门"（首个 `commit` 落库后、
+响应返回前暂停，由另一线程抢先写入）确定性复现上述交错，逐一核对
+`PUT /update`、`POST /devices`、`POST /confirm` 的响应快照与最终数据库
+状态均符合串行执行；第 13 节验证提交失败不报成功、不留部分写入。
+
+```bash
+pip install httpx   # TestClient 依赖（应用本身不需要）
+python test_api.py
+```
 
 ## API 一览
 

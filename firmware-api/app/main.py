@@ -23,7 +23,10 @@ SQLite（WAL 模式）。已确认镜像、候选分块、声明、试启令牌�
 并发
 ~~~~
 所有写事务以 BEGIN IMMEDIATE 获取库级写锁，配合 busy_timeout，
-操作序列等价于某种串行执行。
+操作序列等价于某种串行执行。写请求的响应快照在同一写事务内、
+提交之前生成（写锁保证其间无其他写入混入），且只在提交成功后
+才返回；因此响应严格反映本次操作完成时的状态，后续请求的写入
+不会混入本次响应。
 """
 
 from __future__ import annotations
@@ -349,15 +352,9 @@ def create_device(body: CreateDevice) -> dict[str, Any]:
             "declared_len, declared_sha, updated_at) VALUES (?, 1, NULL, NULL, NULL, NULL, ?)",
             (body.device_id, now),
         )
-        conn.commit()
-    finally:
-        conn.close()
-
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        dev = _get_device(conn, body.device_id)
-        view = _device_view(conn, dev)
+        # 在同一写事务内生成响应快照：写锁保证其间无其他写入，
+        # 响应即创建完成时的初始状态；提交成功后才返回
+        view = _device_view(conn, _get_device(conn, body.device_id))
         conn.commit()
         return view
     finally:
@@ -401,14 +398,9 @@ def declare_update(device_id: str, body: DeclareUpdate) -> dict[str, Any]:
                          "试启未决期间禁止写入两槽（先确认或重启回退）", 409)
         slot = 1 - dev["confirmed_slot"]
         _reset_staging(conn, device_id, slot, body.length, body.sha256)
-        conn.commit()
-    finally:
-        conn.close()
-
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        view = _device_view(conn, _get_device(conn, device_id))
+        # 写锁仍持有：快照即本次声明落库后的状态，后续请求的写入
+        # 不会混入；提交成功后才返回
+        view = _device_view(conn, dev)
         conn.commit()
         return view
     finally:
@@ -695,13 +687,8 @@ def confirm(device_id: str, token: str) -> dict[str, Any]:
             "trial_token = NULL WHERE device_id = ?",
             (new_slot, device_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
-
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
+        # 在同一写事务内生成响应快照：确认结果不含随后请求的写入；
+        # 提交成功后才返回
         view = _device_view(conn, _get_device(conn, device_id))
         conn.commit()
         return view

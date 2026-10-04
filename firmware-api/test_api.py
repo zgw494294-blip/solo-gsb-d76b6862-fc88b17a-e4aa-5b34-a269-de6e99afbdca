@@ -5,6 +5,7 @@
 import base64
 import importlib
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -317,5 +318,173 @@ expected_candidate = 1 - final_st["confirmed_slot"]
 check("candidate view",
       cand["candidate_slot"] == expected_candidate
       and "chunks" in cand and cand["bootable"] is False, cand)
+
+print("== 12. 受控交错：响应快照即本次操作完成时的状态，不混入后续写入 ==")
+
+class CommitGate:
+    """一次性提交闸门：包装 m._connect，让首个 commit 在落库成功后、
+    响应返回前暂停，直到 may_return 置位。借此在主线程确定性制造
+    「T1 已提交、响应未返回，T2 抢先写入」的受控交错。"""
+
+    def __init__(self):
+        self.committed = threading.Event()
+        self.may_return = threading.Event()
+        self._armed = True
+        self._real_connect = m._connect
+
+    def __enter__(self):
+        gate = self
+        real_connect = self._real_connect
+
+        class HookedConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def commit(self):
+                self._inner.commit()
+                if gate._armed:
+                    gate._armed = False
+                    gate.committed.set()
+                    gate.may_return.wait(timeout=15)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        m._connect = lambda: HookedConn(real_connect())
+        return self
+
+    def __exit__(self, *exc):
+        m._connect = self._real_connect
+        self.may_return.set()  # 异常路径也放行，避免线程挂死
+        return False
+
+
+def run_gated(primary, compete):
+    """线程中执行 primary；其首个 commit 成功后、响应返回前，
+    由当前线程执行 compete()，然后放行 primary 并等其结束。"""
+    with CommitGate() as gate:
+        t = threading.Thread(target=primary)
+        t.start()
+        try:
+            assert gate.committed.wait(timeout=15), "primary 未及时提交"
+            compete()
+        finally:
+            gate.may_return.set()
+            t.join(timeout=15)
+    assert not t.is_alive(), "primary 线程未结束"
+
+
+# 12a. PUT /update：T1 声明长度 3 提交后、返回查询前，T2 写入长度 6
+client3.post("/devices", json={"device_id": "dev-race", "initial_image_base64": b64(b"base-image")})
+resp1, resp2 = {}, {}
+
+def declare_len3():
+    c = TestClient(m.app)
+    r = c.put("/devices/dev-race/update", json={"length": 3, "sha256": "44" * 32})
+    resp1["status"], resp1["body"] = r.status_code, r.json()
+
+def declare_len6():
+    r = client3.put("/devices/dev-race/update", json={"length": 6, "sha256": "55" * 32})
+    resp2["status"], resp2["body"] = r.status_code, r.json()
+
+run_gated(declare_len3, declare_len6)
+check("declare#1 (len 3) response reflects its own commit",
+      resp1["status"] == 200
+      and resp1["body"]["slots"]["slot1"]["declared_length"] == 3, resp1)
+check("declare#2 (len 6) response reflects its own commit",
+      resp2["status"] == 200
+      and resp2["body"]["slots"]["slot1"]["declared_length"] == 6, resp2)
+st = client3.get("/devices/dev-race").json()
+check("final db = last declare (6), serial order preserved",
+      st["slots"]["slot1"]["declared_length"] == 6
+      and st["slots"]["slot1"]["declared_sha256"] == "55" * 32, st["slots"]["slot1"])
+
+# 12b. POST /devices：创建提交后、返回前另有声明写入，创建响应保持初始状态
+resp_create, resp_decl = {}, {}
+
+def create_dev():
+    c = TestClient(m.app)
+    r = c.post("/devices", json={"device_id": "dev-race2",
+                                 "initial_image_base64": b64(b"img-v1")})
+    resp_create["status"], resp_create["body"] = r.status_code, r.json()
+
+def declare_on_new():
+    r = client3.put("/devices/dev-race2/update", json={"length": 9, "sha256": "66" * 32})
+    resp_decl["status"], resp_decl["body"] = r.status_code, r.json()
+
+run_gated(create_dev, declare_on_new)
+check("create 201", resp_create["status"] == 201, resp_create.get("status"))
+check("create response keeps initial state (slot1 empty, no declaration)",
+      resp_create["body"]["slots"]["slot1"]["status"] == "empty"
+      and resp_create["body"]["slots"]["slot1"]["declared_length"] is None,
+      resp_create["body"]["slots"]["slot1"])
+check("competing declare applied", resp_decl["status"] == 200
+      and resp_decl["body"]["slots"]["slot1"]["declared_length"] == 9, resp_decl)
+st = client3.get("/devices/dev-race2").json()
+check("final db has the later declaration",
+      st["slots"]["slot1"]["declared_length"] == 9
+      and st["slots"]["slot1"]["status"] == "in-progress", st["slots"]["slot1"])
+
+# 12c. POST /confirm：确认提交后、返回前另有声明写入，确认响应不带入该声明
+client3.post("/devices", json={"device_id": "dev-race3", "initial_image_base64": b64(b"base3")})
+fw_rc = b"C" * 100
+sha_rc = hashlib.sha256(fw_rc).hexdigest()
+client3.put("/devices/dev-race3/update", json={"length": 100, "sha256": sha_rc})
+client3.put("/devices/dev-race3/chunks", json={"offset": 0, "data_base64": b64(fw_rc)})
+tok_rc = client3.post("/devices/dev-race3/restart").json()["boot_token"]
+resp_conf, resp_decl3 = {}, {}
+
+def do_confirm():
+    c = TestClient(m.app)
+    r = c.post("/devices/dev-race3/confirm", params={"token": tok_rc})
+    resp_conf["status"], resp_conf["body"] = r.status_code, r.json()
+
+def declare_after_confirm():
+    r = client3.put("/devices/dev-race3/update", json={"length": 7, "sha256": "77" * 32})
+    resp_decl3["status"], resp_decl3["body"] = r.status_code, r.json()
+
+run_gated(do_confirm, declare_after_confirm)
+check("confirm 200", resp_conf["status"] == 200, resp_conf.get("status"))
+check("confirm response: confirmed slot1, no later declaration",
+      resp_conf["body"]["confirmed_slot"] == 1
+      and resp_conf["body"]["trial_state"] == "running-confirmed"
+      and resp_conf["body"]["slots"]["slot0"]["status"] == "superseded"
+      and resp_conf["body"]["slots"]["slot0"]["declared_length"] is None,
+      resp_conf["body"])
+check("competing declare applied on slot0", resp_decl3["status"] == 200
+      and resp_decl3["body"]["slots"]["slot0"]["declared_length"] == 7, resp_decl3)
+st = client3.get("/devices/dev-race3").json()
+check("final db: confirmed slot1 + declaration on slot0",
+      st["confirmed_slot"] == 1
+      and st["slots"]["slot0"]["declared_length"] == 7
+      and st["slots"]["slot0"]["status"] == "in-progress", st["slots"]["slot0"])
+
+print("== 13. 提交失败不得报成功，且不留部分写入 ==")
+real_connect = m._connect
+
+class FailingCommitConn:
+    """commit 时抛错并回滚，模拟持久化失败。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def commit(self):
+        self._inner.rollback()
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+m._connect = lambda: FailingCommitConn(real_connect())
+try:
+    strict = TestClient(m.app, raise_server_exceptions=False)
+    r = strict.put("/devices/dev-race/update", json={"length": 8, "sha256": "88" * 32})
+    check("commit failure -> 5xx, never a success", r.status_code >= 500, r.status_code)
+finally:
+    m._connect = real_connect
+st = client3.get("/devices/dev-race").json()
+check("failed commit left no trace (still len 6)",
+      st["slots"]["slot1"]["declared_length"] == 6
+      and st["slots"]["slot1"]["declared_sha256"] == "55" * 32, st["slots"]["slot1"])
 
 print(f"\nALL {PASS} CHECKS PASSED")
