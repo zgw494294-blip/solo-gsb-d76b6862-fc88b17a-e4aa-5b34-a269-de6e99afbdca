@@ -5,9 +5,12 @@
 import base64
 import importlib
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 
 TMP = tempfile.mkdtemp(prefix="fwapi-")
 os.environ["FIRMWARE_DB_PATH"] = os.path.join(TMP, "test.db")
@@ -317,5 +320,231 @@ expected_candidate = 1 - final_st["confirmed_slot"]
 check("candidate view",
       cand["candidate_slot"] == expected_candidate
       and "chunks" in cand and cand["bootable"] is False, cand)
+
+print("== 12. 受控交错：成功响应必须是本次操作完成时的快照，不混入后续写入 ==")
+
+# 挂点在“写事务已 commit、响应尚未返回”时触发。替换它后，第一个命中的
+# 请求会阻塞在 gate 上，测试趁此窗口让第二个请求完整提交，再放行第一个，
+# 从而确定性地构造出“后写在前写返回查询之前落库”的交错。
+@contextmanager
+def paused_first_commit():
+    gate = threading.Event()
+    pick_lock = threading.Lock()
+    state = {"first": True}
+
+    def hook(_name):
+        # 仅第一个提交者阻塞；窗口内完成的后续请求直接放行返回
+        with pick_lock:
+            mine = state["first"]
+            state["first"] = False
+        if mine:
+            gate.wait(timeout=10)
+
+    saved = m.after_commit_hook
+    m.after_commit_hook = hook
+    try:
+        yield gate
+    finally:
+        gate.set()          # 即使断言失败也放行，避免残留守护线程挂死
+        m.after_commit_hook = saved
+
+
+def start(fn, *args, box=None):
+    def run():
+        try:
+            if box is not None:
+                box["v"] = fn(*args)
+        except BaseException as e:  # 失败留待 join 后在主线程断言
+            if box is not None:
+                box["exc"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+print("-- 12a. 两次合法声明（长度 3、6）：响应分别为 3、6，终态为 6 --")
+img3 = b"abc"
+img6 = b"abcdef"
+sha3 = hashlib.sha256(img3).hexdigest()
+sha6 = hashlib.sha256(img6).hexdigest()
+client.post("/devices", json={"device_id": "race-update", "initial_image_base64": b64(b"init")})
+
+boxA, boxB = {}, {}
+with paused_first_commit() as gate:
+    tA = start(lambda: TestClient(m.app).put(
+        "/devices/race-update/update", json={"length": 3, "sha256": sha3}), box=boxA)
+    # 等 A 已提交但尚未返回（挂点阻塞），再让 B 完整跑完
+    for _ in range(200):
+        st = client.get("/devices/race-update").json()
+        if st["slots"]["slot1"]["declared_length"] == 3:
+            break
+        time.sleep(0.01)
+    check("A committed (length 3) before its response returns",
+          client.get("/devices/race-update").json()["slots"]["slot1"]["declared_length"] == 3)
+
+    tB = start(lambda: TestClient(m.app).put(
+        "/devices/race-update/update", json={"length": 6, "sha256": sha6}), box=boxB)
+    tB.join(timeout=10)
+    check("B fully completes (length 6) while A still paused",
+          client.get("/devices/race-update").json()["slots"]["slot1"]["declared_length"] == 6)
+    gate.set()
+    tA.join(timeout=10)
+
+check("no thread raised", "exc" not in boxA and "exc" not in boxB, (boxA, boxB))
+ra, rb = boxA["v"], boxB["v"]
+check("both responses 200", ra.status_code == 200 and rb.status_code == 200,
+      (ra.status_code, rb.status_code))
+a1 = ra.json()["slots"]["slot1"]
+b1 = rb.json()["slots"]["slot1"]
+check("A snapshot shows its own declaration (3)",
+      a1["declared_length"] == 3 and a1["declared_sha256"] == sha3
+      and a1["bytes_received"] == 0, a1)
+check("B snapshot shows its own declaration (6)",
+      b1["declared_length"] == 6 and b1["declared_sha256"] == sha6, b1)
+final = client.get("/devices/race-update").json()["slots"]["slot1"]
+check("final DB state equals serial execution (6, chunks discarded)",
+      final["declared_length"] == 6 and final["declared_sha256"] == sha6
+      and final["status"] == "in-progress" and final["bytes_received"] == 0, final)
+
+print("-- 12b. POST /devices：创建响应保持初始状态，不含随后的声明 --")
+img_c = b"fw-create"
+sha_c = hashlib.sha256(img_c).hexdigest()
+boxC, boxD = {}, {}
+with paused_first_commit() as gate:
+    tC = start(lambda: TestClient(m.app).post(
+        "/devices", json={"device_id": "race-create",
+                          "initial_image_base64": b64(img_c)}), box=boxC)
+    for _ in range(200):
+        if "race-create" in client.get("/devices").json()["devices"]:
+            break
+        time.sleep(0.01)
+    check("create committed but response not returned yet",
+          "race-create" in client.get("/devices").json()["devices"])
+
+    tD = start(lambda: TestClient(m.app).put(
+        "/devices/race-create/update", json={"length": 99, "sha256": "44" * 32}), box=boxD)
+    tD.join(timeout=10)
+    check("later declaration landed (99) before create response returns",
+          client.get("/devices/race-create").json()["slots"]["slot1"]["declared_length"] == 99)
+    gate.set()
+    tC.join(timeout=10)
+
+check("no thread raised", "exc" not in boxC and "exc" not in boxD, (boxC, boxD))
+rc, rd = boxC["v"], boxD["v"]
+check("create 201 / declare 200", rc.status_code == 201 and rd.status_code == 200,
+      (rc.status_code, rd.status_code))
+cv = rc.json()
+check("create response is the initial snapshot (slot0 confirmed, slot1 empty)",
+      cv["confirmed_slot"] == 0 and cv["running_slot"] == 0
+      and cv["slots"]["slot0"]["status"] == "confirmed"
+      and cv["slots"]["slot0"]["image_length"] == len(img_c)
+      and cv["slots"]["slot1"]["status"] == "empty"
+      and cv["slots"]["slot1"]["declared_length"] is None, cv)
+final = client.get("/devices/race-create").json()["slots"]["slot1"]
+check("final DB includes the later declaration (99)",
+      final["declared_length"] == 99, final)
+
+print("-- 12c. POST /confirm：确认响应不带入随后的声明，等价串行顺序 confirm->declare --")
+# 准备一个 trial-pending 设备：slot0 初始镜像，slot1 完整候选
+img_old = b"old-image"
+img_new = b"new-image!!"
+sha_new = hashlib.sha256(img_new).hexdigest()
+client.post("/devices", json={"device_id": "race-confirm",
+                              "initial_image_base64": b64(img_old)})
+client.put("/devices/race-confirm/update",
+           json={"length": len(img_new), "sha256": sha_new})
+client.put("/devices/race-confirm/chunks",
+           json={"offset": 0, "data_base64": b64(img_new)})
+tok = client.post("/devices/race-confirm/restart").json()["boot_token"]
+check("race-confirm trial pending",
+      client.get("/devices/race-confirm").json()["trial_state"] == "trial-pending"
+      and bool(tok))
+
+boxE, boxF = {}, {}
+with paused_first_commit() as gate:
+    tE = start(lambda: TestClient(m.app).post(
+        "/devices/race-confirm/confirm", params={"token": tok}), box=boxE)
+    for _ in range(200):
+        if client.get("/devices/race-confirm").json()["trial_state"] == "running-confirmed":
+            break
+        time.sleep(0.01)
+    check("confirm committed but response not returned yet",
+          client.get("/devices/race-confirm").json()["trial_state"] == "running-confirmed")
+
+    # 确认已解锁写入：针对新的候选槽（旧确认槽 0）声明 7 字节
+    tF = start(lambda: TestClient(m.app).put(
+        "/devices/race-confirm/update", json={"length": 7, "sha256": "55" * 32}), box=boxF)
+    tF.join(timeout=10)
+    check("post-confirm declaration landed (7) on slot0 before confirm response returns",
+          client.get("/devices/race-confirm").json()["slots"]["slot0"]["declared_length"] == 7)
+    gate.set()
+    tE.join(timeout=10)
+
+check("no thread raised", "exc" not in boxE and "exc" not in boxF, (boxE, boxF))
+re_, rf = boxE["v"], boxF["v"]
+check("confirm 200 / declare 200", re_.status_code == 200 and rf.status_code == 200,
+      (re_.status_code, rf.status_code))
+ev = re_.json()
+check("confirm snapshot: slot1 confirmed, slot0 superseded w/o later declaration",
+      ev["confirmed_slot"] == 1 and ev["running_slot"] == 1
+      and ev["trial_state"] == "running-confirmed" and ev["pending_token"] is None
+      and ev["slots"]["slot1"]["status"] == "confirmed"
+      and ev["slots"]["slot1"]["image_sha256"] == sha_new
+      and ev["slots"]["slot0"]["status"] == "superseded"
+      and ev["slots"]["slot0"]["declared_length"] is None, ev)
+final = client.get("/devices/race-confirm").json()
+check("final DB = serial result: confirmed slot1 + later declaration on slot0",
+      final["confirmed_slot"] == 1 and final["trial_state"] == "running-confirmed"
+      and final["slots"]["slot0"]["status"] == "in-progress"
+      and final["slots"]["slot0"]["declared_length"] == 7
+      and final["slots"]["slot1"]["status"] == "confirmed", final)
+
+print("== 13. commit 失败不得报成功：响应 5xx，库状态保持操作前，服务仍可用 ==")
+client.post("/devices", json={"device_id": "commit-fail", "initial_image_base64": b64(b"base")})
+client.put("/devices/commit-fail/update", json={"length": 4, "sha256": "66" * 32})
+before = client.get("/devices/commit-fail").json()["slots"]["slot1"]
+check("precondition declared 4", before["declared_length"] == 4, before)
+
+real_connect = m.sqlite3.connect
+client500 = TestClient(m.app, raise_server_exceptions=False)
+try:
+    class FailingConn:
+        """代理连接：第一次 commit 抛错，模拟提交失败（此前写入全部随回滚丢弃）。"""
+
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+            object.__setattr__(self, "_armed", True)
+
+        def commit(self):
+            if object.__getattribute__(self, "_armed"):
+                object.__setattr__(self, "_armed", False)
+                self._real.rollback()
+                raise sqlite3.OperationalError("simulated commit failure")
+            return self._real.commit()
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+        def __setattr__(self, name, value):
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+    def failing_connect(*a, **kw):
+        return FailingConn(real_connect(*a, **kw))
+
+    m.sqlite3.connect = failing_connect
+    r = client500.put("/devices/commit-fail/update",
+                      json={"length": 8, "sha256": "77" * 32})
+finally:
+    m.sqlite3.connect = real_connect
+
+check("failed commit -> 5xx, not 2xx", 500 <= r.status_code < 600, r.status_code)
+after = client.get("/devices/commit-fail").json()["slots"]["slot1"]
+check("DB unchanged after failed commit (still 4)",
+      after["declared_length"] == 4 and after["declared_sha256"] == "66" * 32, after)
+check("service healthy after commit failure", client.get("/health").status_code == 200)
+r = client.put("/devices/commit-fail/update", json={"length": 8, "sha256": "77" * 32})
+check("subsequent request succeeds once storage is fine",
+      r.status_code == 200 and r.json()["slots"]["slot1"]["declared_length"] == 8)
 
 print(f"\nALL {PASS} CHECKS PASSED")

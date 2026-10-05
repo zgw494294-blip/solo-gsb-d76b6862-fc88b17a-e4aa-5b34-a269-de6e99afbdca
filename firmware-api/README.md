@@ -55,6 +55,11 @@ FIRMWARE_DB_PATH=./firmware.db uvicorn app.main:app --port 8000
     之后迟到的确认返回 **`409`**。
   - 两槽**禁止任何写入**（声明 / 分块都返回 `409 trial_pending_write_locked`）。
 - 并发操作经 SQLite `BEGIN IMMEDIATE` 串行化，等价于某种串行执行。
+- **成功响应反映“本次操作完成时”的状态**：`PUT /update`、`POST /devices`、
+  `POST /confirm` 的响应快照都在各自的写事务内、`commit` 之前生成，
+  只有持久化成功才返回 2xx。因此即使第二个请求在第一个请求“已提交但响应
+  尚未发出”的窗口内落库，后写入也不会混入第一个响应；提交失败返回 5xx，
+  绝不报成功（事务回滚，库保持操作前状态）。
 
 ## API 一览
 
@@ -221,3 +226,105 @@ curl -s -X POST "http://localhost:8000/devices/dev-001/confirm?token=$TOKEN3" | 
 ```
 
 候选不完整 / 摘要错误时重启，旧镜像同样直接启动（候选不会被试启）。
+
+## 并发交错复现（受控、确定性）
+
+**问题背景**：同一设备两次合法声明（长度 3、6），若第二个请求在第一个请求
+“写事务已提交、响应还在回读”的窗口内落库，旧实现会在**新连接**里回读状态，
+导致**两份响应都显示 `declared_length=6`**。修复后写接口在同一写事务内
+生成快照，两份响应必须分别为 `3`、`6`，最终库状态为 `6`（等价串行顺序 A→B）。
+
+为了不靠“碰运气”并发来复现，服务内置了一个**默认关闭**的受控挂点：
+设置环境变量 `FIRMWARE_TEST_PAUSE_DIR=<目录>` 后，写接口在
+“commit 成功、返回响应之前”检查该目录下与接口同名的标记文件
+（`declare_update` / `create_device` / `confirm`）；第一个命中的请求会
+原子接管标记（重命名为 `<name>.held`）并阻塞，删除 `.held` 即放行，
+其余请求不受影响。正常启动（不设该变量）时此挂点为空操作。
+
+### 方式一：Docker Compose（沿用同一持久卷）
+
+覆盖层只增加挂点目录与环境变量，数据仍在命名卷 `firmware-data`：
+
+```bash
+# 宿主目录供脚本与容器共享标记文件
+mkdir -p /tmp/fw-pause
+
+docker compose -f docker-compose.yml -f docker-compose.race.yml up --build -d
+
+bash scripts/race_repro.sh
+```
+
+脚本输出（PASS）：
+
+```
+A 响应 declared_length = 3   （期望 3）
+B 响应 declared_length = 6   （期望 6）
+最终数据库 declared_length = 6 （期望 6）
+PASS：响应快照彼此独立，终态等价串行执行（A -> B）。
+```
+
+复现结束恢复常规启动（数据卷不变）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.race.yml down
+docker compose up --build -d        # 不含挂点，FIRMWARE_TEST_PAUSE_DIR 未设置
+```
+
+### 方式二：本地运行（无 Docker）
+
+```bash
+pip install -r requirements.txt
+mkdir -p /tmp/fw-pause /tmp/fw-data
+FIRMWARE_DB_PATH=/tmp/fw-data/firmware.db \
+FIRMWARE_TEST_PAUSE_DIR=/tmp/fw-pause \
+uvicorn app.main:app --port 8000 &
+
+bash scripts/race_repro.sh
+```
+
+### 手工等价 HTTP 调用（想逐步执行时）
+
+```bash
+SHA3=$(printf abc  | sha256sum | cut -d' ' -f1)
+SHA6=$(printf abcdef | sha256sum | cut -d' ' -f1)
+B64=$(printf base | base64 | tr -d '\n')
+
+curl -s -X POST http://localhost:8000/devices -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"dev-race\",\"initial_image_base64\":\"$B64\"}" >/dev/null
+
+# 1) 放置标记，发起声明 A（length=3）——它会提交后挂起
+: > /tmp/fw-pause/declare_update
+curl -s -X PUT http://localhost:8000/devices/dev-race/update \
+  -H 'Content-Type: application/json' \
+  -d "{\"length\":3,\"sha256\":\"$SHA3\"}" > /tmp/respA.json &
+
+# 2) 轮询确认 A 已落库（应打印 3）
+sleep 0.2
+curl -s http://localhost:8000/devices/dev-race | grep -o '"declared_length":[0-9]*'
+
+# 3) A 尚未返回时，完整执行声明 B（length=6）
+curl -s -X PUT http://localhost:8000/devices/dev-race/update \
+  -H 'Content-Type: application/json' \
+  -d "{\"length\":6,\"sha256\":\"$SHA6\"}" | grep -o '"declared_length":[0-9]*'   # 6
+
+# 4) 放行 A；修复前 /tmp/respA.json 里是 6（混入），修复后必须是 3
+rm -f /tmp/fw-pause/declare_update.held
+wait
+grep -o '"declared_length":[0-9]*' /tmp/respA.json    # 期望 3
+```
+
+## 回归测试
+
+```bash
+pip install -r requirements.txt httpx   # TestClient 依赖 httpx
+python3 test_api.py
+```
+
+除既有端到端场景外，包含两组与本问题相关的回归：
+
+- **受控交错（第 12 节）**：通过挂点确定性制造“后写在前写返回前落库”的交错，
+  分别核对两次 `PUT /update`（长度 3、6）、`POST /devices`（创建响应保持初始
+  状态）、`POST /confirm`（确认响应不带入随后声明）的**响应快照**与**最终
+  数据库状态**均等价于串行执行。
+- **提交失败不报成功（第 13 节）**：注入连接代理让 `commit` 抛错，断言接口
+  返回 5xx、库状态保持操作前、服务仍可继续处理请求。

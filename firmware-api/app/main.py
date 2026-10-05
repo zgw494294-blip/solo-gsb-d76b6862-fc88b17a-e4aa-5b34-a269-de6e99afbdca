@@ -23,7 +23,10 @@ SQLite（WAL 模式）。已确认镜像、候选分块、声明、试启令牌�
 并发
 ~~~~
 所有写事务以 BEGIN IMMEDIATE 获取库级写锁，配合 busy_timeout，
-操作序列等价于某种串行执行。
+操作序列等价于某种串行执行。写接口的成功响应在**同一写事务内**生成
+状态快照，仅在 commit 成功后返回（不另开连接回读），所以响应反映的是
+本次操作完成时的状态：即使响应尚未发出时下一个写请求已经提交，其写入
+也不会混入本次响应快照。commit 失败直接抛出（5xx），不会返回成功。
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import hashlib
 import os
 import secrets
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -52,6 +56,33 @@ DB_PATH = os.environ.get("FIRMWARE_DB_PATH", "/data/firmware.db")
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# 受控交错挂点：写事务 commit 成功、响应返回之前调用（入参为接口名）。
+# 默认空操作，生产环境零行为变化。仅在显式设置环境变量
+# FIRMWARE_TEST_PAUSE_DIR=<目录> 时启用：若该目录下存在与接口同名的标记文件
+# （declare_update / create_device / confirm），**第一个**命中的请求通过
+# 原子 rename 接管标记（变为 <name>.held）并在“已提交但未返回”的窗口阻塞，
+# 直到 .held 文件被删除；后续请求见不到原标记，直接放行。这样可以在第一个
+# 请求被挂起期间让第二个请求完整落库，确定性地构造交错。
+PAUSE_DIR = os.environ.get("FIRMWARE_TEST_PAUSE_DIR")
+
+
+def after_commit_hook(name: str) -> None:
+    pause_dir = PAUSE_DIR
+    if not pause_dir:
+        return
+    marker = os.path.join(pause_dir, name)
+    held = os.path.join(pause_dir, name + ".held")
+    try:
+        # 原子接管：只有一个请求能成功；其余请求直接放行返回
+        os.rename(marker, held)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    while os.path.exists(held):
+        time.sleep(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -349,19 +380,15 @@ def create_device(body: CreateDevice) -> dict[str, Any]:
             "declared_len, declared_sha, updated_at) VALUES (?, 1, NULL, NULL, NULL, NULL, ?)",
             (body.device_id, now),
         )
+        # 在同一写事务内取本次创建完成时的快照，提交后直接返回，
+        # 不另开连接回读：之后（如紧接着的声明）不会混入创建响应。
+        view = _device_view(conn, _get_device(conn, body.device_id))
         conn.commit()
     finally:
         conn.close()
 
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        dev = _get_device(conn, body.device_id)
-        view = _device_view(conn, dev)
-        conn.commit()
-        return view
-    finally:
-        conn.close()
+    after_commit_hook("create_device")
+    return view
 
 
 @app.get("/devices")
@@ -401,18 +428,16 @@ def declare_update(device_id: str, body: DeclareUpdate) -> dict[str, Any]:
                          "试启未决期间禁止写入两槽（先确认或重启回退）", 409)
         slot = 1 - dev["confirmed_slot"]
         _reset_staging(conn, device_id, slot, body.length, body.sha256)
+        # 快照必须在写事务内、commit 之前生成：这样快照只包含本声明的效果。
+        # 若在 commit 之后另开连接回读，下一个声明可能已落库，两次响应会
+        # 都显示后一次的 declared_length。
+        view = _device_view(conn, _get_device(conn, device_id))
         conn.commit()
     finally:
         conn.close()
 
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        view = _device_view(conn, _get_device(conn, device_id))
-        conn.commit()
-        return view
-    finally:
-        conn.close()
+    after_commit_hook("declare_update")
+    return view
 
 
 @app.put("/devices/{device_id}/chunks", status_code=status.HTTP_200_OK)
@@ -695,15 +720,12 @@ def confirm(device_id: str, token: str) -> dict[str, Any]:
             "trial_token = NULL WHERE device_id = ?",
             (new_slot, device_id),
         )
+        # 在同一写事务内取确认完成时的快照：随后才提交的新声明（确认解锁
+        # 之后即可写入）不会被带进本次确认响应。
+        view = _device_view(conn, _get_device(conn, device_id))
         conn.commit()
     finally:
         conn.close()
 
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        view = _device_view(conn, _get_device(conn, device_id))
-        conn.commit()
-        return view
-    finally:
-        conn.close()
+    after_commit_hook("confirm")
+    return view
